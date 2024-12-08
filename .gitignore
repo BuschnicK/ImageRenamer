@@ -1,10 +1,2 @@
-x64
-.suo
-Browse.VC.db
-Browse.VC.opendb
-GPX-TO-KML.ipch
-/.vs/GpxToKml/v16/ipch/AutoPCH/68560e16f4d5a03a/*.ipch
-lib
-/bin/*.pdb
-/bin/*.iobj
-/bin/*.ipdb
+.vs/
+bin/
