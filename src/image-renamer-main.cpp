@@ -31,6 +31,75 @@ enum SegmentMarker : std::uint16_t {
   kTiffByteOrderBigEndian = 0x4d4d,  // "MM"
 };
 
+// There are many EXIF tags. We only care about a handful.
+// https://exiftool.org/TagNames/EXIF.html (https://exiftool.org/htmldump.html)
+// https://exiv2.org/tags.html
+enum ExifTags : std::uint16_t {
+  kExifOffset = 0x8769,
+  kDateTimeOriginal = 0x9003,
+  kTimeZoneOffset = 0x882a,
+};
+
+// http://www.fifi.org/doc/jhead/exif-e.html
+enum ExifFormat : std::uint16_t {
+  kUInt8 = 1,
+  kAscii = 2,
+  kUInt16 = 3,
+  kUInt32 = 4,
+  kURational = 5,
+  kSInt8 = 6,
+  kUndefined = 7,
+  kSInt16 = 8,
+  kSInt32 = 9,
+  kSRational = 10,
+  kFloat = 11,
+  kDouble = 12,
+};
+
+int GetSize(const ExifFormat format) {
+  switch (format) {
+    case kUInt8:
+    case kSInt8:
+    case kAscii:
+    case kUndefined: 
+      return 1;
+    case kUInt16:
+    case kSInt16: 
+      return 2; 
+    case kUInt32:
+    case kSInt32:
+    case kFloat: 
+      return 4;
+    case kURational:
+    case kSRational:
+    case kDouble:
+      return 8;
+  }
+  throw std::invalid_argument("Invalid EXIF format tag.");
+}
+
+// Image File Directory entry. Each entry is 12 bytes.
+// - 2 bytes tag number
+// - 2 bytes data format
+// - 4 bytes number of components
+// - 4 bytes data or offset to data
+struct IfdEntry {
+  std::uint16_t tag;
+  std::uint16_t format;
+  std::uint32_t num_components;
+  union {
+    std::uint32_t data;
+    std::uint32_t offset;
+  } payload;
+};
+
+void Expect(bool expectation, std::string_view message = "") {
+  if (!expectation) {
+    throw std::runtime_error(
+        boost::str(boost::format("Expectation failed: %s") % message));
+  }
+}
+
 std::uint16_t ReadWord(
     std::istream& stream,
     SegmentMarker byte_order = SegmentMarker::kTiffByteOrderBigEndian) {
@@ -64,11 +133,23 @@ void ReadBytes(std::istream& stream, char* destination, int size) {
   }
 }
 
-void Expect(bool expectation, std::string_view message = "") {
-  if (!expectation) {
-    throw std::runtime_error(
-        boost::str(boost::format("Expectation failed: %s") % message));
+IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
+  IfdEntry entry {
+    .tag = ReadWord(stream, byte_order), 
+    .format = ReadWord(stream, byte_order),
+    .num_components = ReadDoubleWord(stream, byte_order),
+    .payload = ReadDoubleWord(stream, byte_order),
+  };
+  /*  
+  // Format determines the size of a single component. Multiplying that
+  // with the number of components gives us the size. This in turn determines
+  // whether the value is stored or an offset to the value.
+  const int total_size =
+      GetSize(static_cast<ExifFormat>(entry.format)) * entry.num_components;
+  if (total_size > 4) {
   }
+  */
+  return entry;
 }
 
 void ReadExifData(std::string_view filename) { 
@@ -95,11 +176,18 @@ void ReadExifData(std::string_view filename) {
   Expect(file.seekg(ifd0_offset - 8, std::ios_base::cur).good(),
          "Invalid IFD0 offset.");
   const std::uint16_t num_ifd0_entries = ReadWord(file, tiff_byte_order);
-  // Each entry is 12 bytes.
-  // - 2 bytes tag number
-  // - 2 bytes data format
-  // - 4 bytes number of components
-  // - 4 bytes data or offset to data
+  std::vector<IfdEntry> entries;
+  for (int i = 0; i < num_ifd0_entries; ++i) {
+    IfdEntry entry = ReadIfdEntry(file, tiff_byte_order);
+    // Only remember the entries we care about.
+    switch (entry.tag) {
+      case kExifOffset:
+      case kDateTimeOriginal:
+      case kTimeZoneOffset:
+        entries.push_back(std::move(entry));
+    }
+  }
+
 }
 
 void Main(std::string_view input_dir,
