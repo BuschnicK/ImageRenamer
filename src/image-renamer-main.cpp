@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -23,6 +24,84 @@
 
 namespace {
 
+enum SegmentMarker : std::uint16_t {
+  kJpegHeader = 0xffd8,
+  kApp1Header = 0xffe1,
+  kTiffByteOrderLittleEndian = 0x4949,  // "II"
+  kTiffByteOrderBigEndian = 0x4d4d,  // "MM"
+};
+
+std::uint16_t ReadWord(
+    std::istream& stream,
+    SegmentMarker byte_order = SegmentMarker::kTiffByteOrderBigEndian) {
+  std::uint16_t word;
+  stream.read(reinterpret_cast<char*>(&word), sizeof(word));
+  if (!stream) {
+    throw std::runtime_error("Failed reading file.");
+  }
+  return byte_order == SegmentMarker::kTiffByteOrderBigEndian
+             ? _byteswap_ushort(word)
+             : word;
+}
+
+std::uint32_t ReadDoubleWord(
+    std::istream& stream,
+    SegmentMarker byte_order = SegmentMarker::kTiffByteOrderBigEndian) {
+  std::uint32_t dword;
+  stream.read(reinterpret_cast<char*>(&dword), sizeof(dword));
+  if (!stream) {
+    throw std::runtime_error("Failed reading file.");
+  }
+  return byte_order == SegmentMarker::kTiffByteOrderBigEndian
+             ? _byteswap_ulong(dword)
+             : dword;
+}
+
+void ReadBytes(std::istream& stream, char* destination, int size) {
+  stream.read(destination, size);
+  if (!stream) {
+    throw std::runtime_error("Failed reading file.");
+  }
+}
+
+void Expect(bool expectation, std::string_view message = "") {
+  if (!expectation) {
+    throw std::runtime_error(
+        boost::str(boost::format("Expectation failed: %s") % message));
+  }
+}
+
+void ReadExifData(std::string_view filename) { 
+  std::ifstream file(filename.data(),
+                     std::ios_base::in | std::ios_base::binary);
+  Expect(ReadWord(file) == SegmentMarker::kJpegHeader, "Missing JPEG header.");
+  Expect(ReadWord(file) == SegmentMarker::kApp1Header, "Missing APP1 header.");
+  const std::uint16_t app1_size = ReadWord(file);
+
+  char exif_header[6];
+  ReadBytes(file, exif_header, 6);
+  Expect(strncmp(exif_header, "Exif\0\0", 6) == 0, "Missing EXIF header.");
+
+  const SegmentMarker tiff_byte_order =
+      static_cast<SegmentMarker>(ReadWord(file));
+  Expect(tiff_byte_order == SegmentMarker::kTiffByteOrderBigEndian ||
+             tiff_byte_order == SegmentMarker::kTiffByteOrderLittleEndian,
+         "Unexpected TIFF byte order marker.");
+  Expect(ReadWord(file, tiff_byte_order) == 42, "Unexpected TIFF byte order control value.");
+
+  // The offset to the first image file descriptor. From the beginning of 
+  // the TIFF file, so in our case starting at the TIFF header.
+  const std::uint32_t ifd0_offset = ReadDoubleWord(file, tiff_byte_order);
+  Expect(file.seekg(ifd0_offset - 8, std::ios_base::cur).good(),
+         "Invalid IFD0 offset.");
+  const std::uint16_t num_ifd0_entries = ReadWord(file, tiff_byte_order);
+  // Each entry is 12 bytes.
+  // - 2 bytes tag number
+  // - 2 bytes data format
+  // - 4 bytes number of components
+  // - 4 bytes data or offset to data
+}
+
 void Main(std::string_view input_dir,
           std::optional<std::string_view> output_dir_string) {
   if (!output_dir_string.has_value()) {
@@ -35,12 +114,15 @@ void Main(std::string_view input_dir,
   }
 
   boost::asio::io_context io_context;
+  auto work_guard = boost::asio::make_work_guard(io_context);
   boost::thread_group threads;
   for (std::size_t i = 0; i < std::thread::hardware_concurrency(); ++i) {
     threads.create_thread(
         boost::bind(&boost::asio::io_context::run, &io_context));
   }
 
+  std::atomic<int> num_processed_successfully = 0;
+  std::atomic<int> num_failed = 0;  
   std::atomic<int> num_in_progress = 0;
   std::mutex mutex;
   std::condition_variable busy;
@@ -54,29 +136,37 @@ void Main(std::string_view input_dir,
     if (extension != ".jpg" && extension != ".jpeg") {
       continue;
     }
-    std::osyncstream(std::cout) << "Reading: " << entry << std::endl;
-
     std::unique_lock<std::mutex> lock(mutex);
     // Rate limit the work queue to twice the number of tasks as threads.
     while (num_in_progress >= threads.size() * 2) {
-      busy.wait(lock);
+       busy.wait(lock);
     }
     ++num_in_progress;
 
-    boost::asio::post(io_context, [entry, output_dir, &num_in_progress, &busy]() {
+    boost::asio::post(io_context, [entry, output_dir, &num_in_progress,
+                                   &num_processed_successfully,
+                                   &num_failed, &busy]() {
       try {
+        std::osyncstream(std::cout) << "Reading: " << entry << std::endl;
+        ReadExifData(entry.path().string());
         --num_in_progress;
+        ++num_processed_successfully;
         busy.notify_one();
       } catch (const std::exception& error) {
-        std::osyncstream(std::cerr) << "error: " << error.what() << std::endl;
+        std::osyncstream(std::cerr)
+            << "error: " << entry.path().string() << " " << error.what() << std::endl;
         --num_in_progress;
+        ++num_failed;
         busy.notify_one();
       }
     });
   }
 
-  io_context.stop();
+  work_guard.reset();
   threads.join_all();
+
+  std::cout << num_processed_successfully << " succeeded, " << num_failed
+            << " failed" << std::endl;
 }
 
 }  // namespace
