@@ -38,6 +38,7 @@ enum ExifTags : std::uint16_t {
   kExifOffset = 0x8769,
   kDateTimeOriginal = 0x9003,
   kTimeZoneOffset = 0x882a,
+  kOffsetTimeOriginal = 0x9011,
 };
 
 // http://www.fifi.org/doc/jhead/exif-e.html
@@ -152,7 +153,7 @@ IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
   return entry;
 }
 
-void ReadExifData(std::string_view filename) { 
+void ReadExifData(std::string_view filename) {
   std::ifstream file(filename.data(),
                      std::ios_base::in | std::ios_base::binary);
   Expect(ReadWord(file) == SegmentMarker::kJpegHeader, "Missing JPEG header.");
@@ -168,9 +169,10 @@ void ReadExifData(std::string_view filename) {
   Expect(tiff_byte_order == SegmentMarker::kTiffByteOrderBigEndian ||
              tiff_byte_order == SegmentMarker::kTiffByteOrderLittleEndian,
          "Unexpected TIFF byte order marker.");
-  Expect(ReadWord(file, tiff_byte_order) == 42, "Unexpected TIFF byte order control value.");
+  Expect(ReadWord(file, tiff_byte_order) == 42,
+         "Unexpected TIFF byte order control value.");
 
-  // The offset to the first image file descriptor. From the beginning of 
+  // The offset to the first image file descriptor. From the beginning of
   // the TIFF file, so in our case starting at the TIFF header.
   const std::uint32_t ifd0_offset = ReadDoubleWord(file, tiff_byte_order);
   Expect(file.seekg(ifd0_offset - 8, std::ios_base::cur).good(),
@@ -179,15 +181,54 @@ void ReadExifData(std::string_view filename) {
   std::vector<IfdEntry> entries;
   for (int i = 0; i < num_ifd0_entries; ++i) {
     IfdEntry entry = ReadIfdEntry(file, tiff_byte_order);
-    // Only remember the entries we care about.
     switch (entry.tag) {
       case kExifOffset:
       case kDateTimeOriginal:
       case kTimeZoneOffset:
+      case kOffsetTimeOriginal:
         entries.push_back(std::move(entry));
     }
   }
+  for (const IfdEntry& ifd_entry : entries) {
+    if (ifd_entry.tag == kExifOffset) {
+      Expect(file.seekg(ifd_entry.payload.offset, std::ios_base::beg).good(),
+             "Invalid IFD offset.");
+      break;
+    }
+  }
+  // Read the IFD:
+  const std::uint16_t num_ifd_entries = ReadWord(file, tiff_byte_order);
+  for (int i = 0; i < num_ifd_entries; ++i) {
+    IfdEntry entry = ReadIfdEntry(file, tiff_byte_order);
+    switch (entry.tag) {
+      case kDateTimeOriginal:
+      case kTimeZoneOffset:
+      case kOffsetTimeOriginal:
+        entries.push_back(std::move(entry));
+    }
+  }
+  for (const IfdEntry& ifd_entry : entries) {
+    switch (ifd_entry.tag) {
+      case kDateTimeOriginal: {
+        // Offsets are relative to the beginning of the exiff file, so we need 
+        // to skip JPEG, APP1 and EXIF headers bytes.
+        Expect(file.seekg(ifd_entry.payload.offset + 0xc, std::ios_base::beg)
+                   .good(),
+            "Invalid IFD offset.");
 
+        std::string date_string(std::min<size_t>(ifd_entry.num_components, 100),
+                                '\0');
+        ReadBytes(file, &date_string[0], static_cast<int>(date_string.size()));
+        std::osyncstream(std::cout) << date_string << std::endl;
+      } break;
+      case kOffsetTimeOriginal: {
+
+      } break;
+      case kTimeZoneOffset: {
+        break;
+      }
+    }
+  }
 }
 
 void Main(std::string_view input_dir,
