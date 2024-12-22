@@ -16,6 +16,7 @@
 
 #include "boost/algorithm/string/case_conv.hpp"
 #include "boost/asio.hpp"
+#include "boost/date_time/local_time/local_time_io.hpp"
 #include "boost/filesystem.hpp"
 #include "boost/format.hpp"
 #include "boost/nowide/fstream.hpp"
@@ -76,7 +77,8 @@ int GetSize(const ExifFormat format) {
     case kDouble:
       return 8;
   }
-  throw std::invalid_argument("Invalid EXIF format tag.");
+  throw std::invalid_argument(
+      boost::str(boost::format("Invalid EXIF format tag %i.") % format));
 }
 
 // Image File Directory entry. Each entry is 12 bytes.
@@ -134,6 +136,37 @@ void ReadBytes(std::istream& stream, char* destination, int size) {
   }
 }
 
+bool IsDataInlined(const IfdEntry& entry) {
+  // Format determines the size of a single component. Multiplying that
+  // with the number of components gives us the size. This in turn determines
+  // whether the value is stored directly or an offset to the value.
+  return GetSize(static_cast<ExifFormat>(entry.format)) *
+             entry.num_components <=
+         4;
+}
+
+boost::local_time::local_date_time ParseTime(
+    std::string_view date_string, std::string_view timezone_offset_string) {
+  boost::local_time::local_time_input_facet* input_facet =
+      new boost::local_time::local_time_input_facet();
+  input_facet->format("%Y:%m:%d %H:%M:%S%Q");
+  std::stringstream datetime_stream;
+  datetime_stream.imbue(std::locale(datetime_stream.getloc(), input_facet));
+  datetime_stream << date_string << timezone_offset_string;
+  boost::local_time::local_date_time time(boost::date_time::not_a_date_time);
+  datetime_stream >> time;
+  return time;
+}
+
+std::string FormatTime(const boost::local_time::local_date_time& time) {
+  boost::local_time::local_time_facet* facet =
+      new boost::local_time::local_time_facet("%Y-%m-%d %H-%M-%S%z");
+  std::ostringstream datetime_stream;
+  datetime_stream.imbue(std::locale(datetime_stream.getloc(), facet));
+  datetime_stream << time;
+  return datetime_stream.str();
+}
+
 IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
   IfdEntry entry {
     .tag = ReadWord(stream, byte_order), 
@@ -141,15 +174,6 @@ IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
     .num_components = ReadDoubleWord(stream, byte_order),
     .payload = ReadDoubleWord(stream, byte_order),
   };
-  /*  
-  // Format determines the size of a single component. Multiplying that
-  // with the number of components gives us the size. This in turn determines
-  // whether the value is stored or an offset to the value.
-  const int total_size =
-      GetSize(static_cast<ExifFormat>(entry.format)) * entry.num_components;
-  if (total_size > 4) {
-  }
-  */
   return entry;
 }
 
@@ -191,7 +215,7 @@ void ReadExifData(std::string_view filename) {
   }
   for (const IfdEntry& ifd_entry : entries) {
     if (ifd_entry.tag == kExifOffset) {
-      Expect(file.seekg(ifd_entry.payload.offset, std::ios_base::beg).good(),
+      Expect(file.seekg(ifd_entry.payload.offset +0xc, std::ios_base::beg).good(),
              "Invalid IFD offset.");
       break;
     }
@@ -207,28 +231,48 @@ void ReadExifData(std::string_view filename) {
         entries.push_back(std::move(entry));
     }
   }
+  std::string date_string;
+  std::string time_zone_offset;
   for (const IfdEntry& ifd_entry : entries) {
     switch (ifd_entry.tag) {
       case kDateTimeOriginal: {
+        Expect(!IsDataInlined(ifd_entry),
+               "Datetime is expected to be stored at an offset.");
         // Offsets are relative to the beginning of the exiff file, so we need 
         // to skip JPEG, APP1 and EXIF headers bytes.
         Expect(file.seekg(ifd_entry.payload.offset + 0xc, std::ios_base::beg)
                    .good(),
-            "Invalid IFD offset.");
-
-        std::string date_string(std::min<size_t>(ifd_entry.num_components, 100),
+            "Invalid DatetimeOriginal offset.");
+        date_string =
+            std::string(std::min<size_t>(ifd_entry.num_components, 100),
                                 '\0');
         ReadBytes(file, &date_string[0], static_cast<int>(date_string.size()));
-        std::osyncstream(std::cout) << date_string << std::endl;
       } break;
       case kOffsetTimeOriginal: {
-
+        time_zone_offset = std::string(
+            std::min<size_t>(ifd_entry.num_components, 100), '\0');
+        if (IsDataInlined(ifd_entry)) {
+          memcpy_s(&time_zone_offset[0], time_zone_offset.size(),
+                   reinterpret_cast<const char*>(&ifd_entry.payload.data),
+                   static_cast<int>(time_zone_offset.size()));
+        } else {
+          Expect(file.seekg(ifd_entry.payload.offset + 0xc, std::ios_base::beg)
+                     .good(),
+                 "Invalid OffsetTimeOriginal offset.");
+          ReadBytes(file, &time_zone_offset[0],
+                    static_cast<int>(time_zone_offset.size()));
+        }
       } break;
       case kTimeZoneOffset: {
+        Expect(false, "Don't know how to handle TimeZoneOffset yet.");
         break;
       }
     }
   }
+  const boost::local_time::local_date_time time =
+      ParseTime(date_string, time_zone_offset);
+  std::osyncstream(std::cout)
+      << filename << "\n  " << FormatTime(time) << std::endl;
 }
 
 void Main(std::string_view input_dir,
