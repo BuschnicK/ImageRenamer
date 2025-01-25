@@ -27,6 +27,7 @@ namespace {
 
 enum SegmentMarker : std::uint16_t {
   kJpegHeader = 0xffd8,
+  kApp0Header = 0xffe0,
   kApp1Header = 0xffe1,
   kTiffByteOrderLittleEndian = 0x4949,  // "II"
   kTiffByteOrderBigEndian = 0x4d4d,  // "MM"
@@ -155,6 +156,10 @@ boost::local_time::local_date_time ParseTime(
   datetime_stream << date_string << timezone_offset_string;
   boost::local_time::local_date_time time(boost::date_time::not_a_date_time);
   datetime_stream >> time;
+  if (time.is_not_a_date_time()) {
+    throw std::invalid_argument(boost::str(
+        boost::format("Not a valid date time: \"%s\"") % datetime_stream.str()));
+  }
   return time;
 }
 
@@ -180,8 +185,20 @@ IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
 boost::local_time::local_date_time ReadExifData(std::string_view filename) {
   std::ifstream file(filename.data(),
                      std::ios_base::in | std::ios_base::binary);
+  int num_header_bytes = 0xc;  // Default to JPEG, APP1, EXIF headers
   Expect(ReadWord(file) == SegmentMarker::kJpegHeader, "Missing JPEG header.");
-  Expect(ReadWord(file) == SegmentMarker::kApp1Header, "Missing APP1 header.");
+  std::uint16_t app_header = ReadWord(file);
+  if (app_header == SegmentMarker::kApp0Header) {
+    // Skip App0 header.
+    const std::uint16_t app0_size = ReadWord(file);
+    // The size excludes the two header bytes.
+    Expect(
+        file.seekg(app0_size - 2, std::ios_base::cur).good(),
+        "Invalid APP0 size.");
+    num_header_bytes += app0_size + 2;
+    app_header = ReadWord(file);
+  }
+  Expect(app_header == SegmentMarker::kApp1Header, "Missing APP1 header.");
   const std::uint16_t app1_size = ReadWord(file);
 
   char exif_header[6];
@@ -215,7 +232,9 @@ boost::local_time::local_date_time ReadExifData(std::string_view filename) {
   }
   for (const IfdEntry& ifd_entry : entries) {
     if (ifd_entry.tag == kExifOffset) {
-      Expect(file.seekg(ifd_entry.payload.offset +0xc, std::ios_base::beg).good(),
+      Expect(file.seekg(ifd_entry.payload.offset + num_header_bytes,
+                        std::ios_base::beg)
+                 .good(),
              "Invalid IFD offset.");
       break;
     }
@@ -239,8 +258,8 @@ boost::local_time::local_date_time ReadExifData(std::string_view filename) {
         Expect(!IsDataInlined(ifd_entry),
                "Datetime is expected to be stored at an offset.");
         // Offsets are relative to the beginning of the exiff file, so we need 
-        // to skip JPEG, APP1 and EXIF headers bytes.
-        Expect(file.seekg(ifd_entry.payload.offset + 0xc, std::ios_base::beg)
+        // to skip JPEG, APP0, APP1 and EXIF headers bytes.
+        Expect(file.seekg(ifd_entry.payload.offset + num_header_bytes, std::ios_base::beg)
                    .good(),
             "Invalid DatetimeOriginal offset.");
         date_string =
@@ -256,7 +275,8 @@ boost::local_time::local_date_time ReadExifData(std::string_view filename) {
                    reinterpret_cast<const char*>(&ifd_entry.payload.data),
                    static_cast<int>(time_zone_offset.size()));
         } else {
-          Expect(file.seekg(ifd_entry.payload.offset + 0xc, std::ios_base::beg)
+          Expect(file.seekg(ifd_entry.payload.offset + num_header_bytes,
+                            std::ios_base::beg)
                      .good(),
                  "Invalid OffsetTimeOriginal offset.");
           ReadBytes(file, &time_zone_offset[0],
@@ -280,8 +300,12 @@ std::string ComposeFilename(const boost::filesystem::directory_entry& entry,
   // And keep only the name
   parent_directory = parent_directory.substr(parent_directory.find(" ") + 1);
   std::stringstream out;
-  out << FormatTime(time) << " " << parent_directory << " "
-      << entry.path().filename().stem().string() << ".jpeg";
+  out << FormatTime(time) << " " << parent_directory << " ";
+  if (entry.path().filename().string().starts_with(out.str())) {
+    // The output path already includes our prefix. Skip this file.
+    return "";
+  }
+  out << entry.path().filename().stem().string() << ".jpeg";
   return out.str();
 }
 
@@ -330,13 +354,20 @@ void Main(std::string_view input_dir,
                                    &num_processed_successfully,
                                    &num_failed, &busy]() {
       try {
+        // TODO: support HEIC: D:\Photos\2025\2025-01-18 Flumserberg mit Ava und Yvonne
+        // TODO: support MP4: D:\Photos\2024\2024-12-06 Samichlaus
         std::osyncstream(std::cout) << "Reading: " << entry << std::endl;
         const boost::local_time::local_date_time exif_time = ReadExifData(
             entry.path().string());
         const std::string new_filename = ComposeFilename(entry, exif_time);
-        std::osyncstream(std::cout) << "Renaming:\n   " << entry << "\n-> "
-                                    << output_dir / new_filename << std::endl;
-        boost::filesystem::rename(entry.path(), output_dir / new_filename);
+        if (new_filename.empty()) {
+          std::osyncstream(std::cout) << "Skipping:\n   " << entry << "\n   "
+              << "aleady has desired format" << std::endl;
+        } else {
+          std::osyncstream(std::cout) << "Renaming:\n   " << entry << "\n-> "
+                                      << output_dir / new_filename << std::endl;
+          boost::filesystem::rename(entry.path(), output_dir / new_filename);
+        }
         --num_in_progress;
         ++num_processed_successfully;
         busy.notify_one();
