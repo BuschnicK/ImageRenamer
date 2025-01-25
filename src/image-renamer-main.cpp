@@ -160,7 +160,7 @@ boost::local_time::local_date_time ParseTime(
 
 std::string FormatTime(const boost::local_time::local_date_time& time) {
   boost::local_time::local_time_facet* facet =
-      new boost::local_time::local_time_facet("%Y-%m-%d %H-%M-%S%z");
+      new boost::local_time::local_time_facet("%Y-%m-%d %H-%M-%S");
   std::ostringstream datetime_stream;
   datetime_stream.imbue(std::locale(datetime_stream.getloc(), facet));
   datetime_stream << time;
@@ -177,7 +177,7 @@ IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
   return entry;
 }
 
-void ReadExifData(std::string_view filename) {
+boost::local_time::local_date_time ReadExifData(std::string_view filename) {
   std::ifstream file(filename.data(),
                      std::ios_base::in | std::ios_base::binary);
   Expect(ReadWord(file) == SegmentMarker::kJpegHeader, "Missing JPEG header.");
@@ -269,10 +269,20 @@ void ReadExifData(std::string_view filename) {
       }
     }
   }
-  const boost::local_time::local_date_time time =
-      ParseTime(date_string, time_zone_offset);
-  std::osyncstream(std::cout)
-      << filename << "\n  " << FormatTime(time) << std::endl;
+  return ParseTime(date_string, time_zone_offset);
+}
+
+std::string ComposeFilename(const boost::filesystem::directory_entry& entry,
+    const boost::local_time::local_date_time& time) {
+  std::string parent_directory = entry.path().parent_path().filename().string();
+  // Expect parent directory to be of the format:
+  // 2024-12-12 Descriptive Name
+  // And keep only the name
+  parent_directory = parent_directory.substr(parent_directory.find(" ") + 1);
+  std::stringstream out;
+  out << FormatTime(time) << " " << parent_directory << " "
+      << entry.path().filename().stem().string() << ".jpeg";
+  return out.str();
 }
 
 void Main(std::string_view input_dir,
@@ -321,7 +331,12 @@ void Main(std::string_view input_dir,
                                    &num_failed, &busy]() {
       try {
         std::osyncstream(std::cout) << "Reading: " << entry << std::endl;
-        ReadExifData(entry.path().string());
+        const boost::local_time::local_date_time exif_time = ReadExifData(
+            entry.path().string());
+        const std::string new_filename = ComposeFilename(entry, exif_time);
+        std::osyncstream(std::cout) << "Renaming:\n   " << entry << "\n-> "
+                                    << output_dir / new_filename << std::endl;
+        boost::filesystem::rename(entry.path(), output_dir / new_filename);
         --num_in_progress;
         ++num_processed_successfully;
         busy.notify_one();
@@ -334,7 +349,6 @@ void Main(std::string_view input_dir,
       }
     });
   }
-
   work_guard.reset();
   threads.join_all();
 
