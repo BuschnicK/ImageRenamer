@@ -19,7 +19,10 @@
 #include "boost/date_time/local_time/local_time_io.hpp"
 #include "boost/filesystem.hpp"
 #include "boost/format.hpp"
+#include "boost/nowide/args.hpp"
+#include "boost/nowide/filesystem.hpp"
 #include "boost/nowide/fstream.hpp"
+#include "boost/nowide/iostream.hpp"
 #include "boost/program_options.hpp"
 #include "boost/thread/thread.hpp"
 
@@ -183,8 +186,8 @@ IfdEntry ReadIfdEntry(std::istream& stream, const SegmentMarker byte_order) {
 }
 
 boost::local_time::local_date_time ReadExifData(std::string_view filename) {
-  std::ifstream file(filename.data(),
-                     std::ios_base::in | std::ios_base::binary);
+  boost::nowide::ifstream file(filename.data(),
+                               std::ios_base::in | std::ios_base::binary);
   int num_header_bytes = 0xc;  // Default to JPEG, APP1, EXIF headers
   Expect(ReadWord(file) == SegmentMarker::kJpegHeader, "Missing JPEG header.");
   std::uint16_t app_header = ReadWord(file);
@@ -317,7 +320,7 @@ void Main(std::string_view input_dir,
   const boost::filesystem::path output_dir(output_dir_string->data());
   if (!boost::filesystem::is_directory(output_dir)) {
     throw std::invalid_argument(boost::str(
-        boost::format("Not a directory: \"%s\"") % *output_dir_string));
+        boost::format("Output location is not a directory: \"%s\"") % *output_dir_string));
   }
 
   boost::asio::io_context io_context;
@@ -356,15 +359,18 @@ void Main(std::string_view input_dir,
       try {
         // TODO: support HEIC: D:\Photos\2025\2025-01-18 Flumserberg mit Ava und Yvonne
         // TODO: support MP4: D:\Photos\2024\2024-12-06 Samichlaus
-        std::osyncstream(std::cout) << "Reading: " << entry << std::endl;
+        std::osyncstream(boost::nowide::cout)
+            << "Reading: " << entry << std::endl;
         const boost::local_time::local_date_time exif_time = ReadExifData(
             entry.path().string());
         const std::string new_filename = ComposeFilename(entry, exif_time);
         if (new_filename.empty()) {
-          std::osyncstream(std::cout) << "Skipping:\n   " << entry << "\n   "
+          std::osyncstream(boost::nowide::cout)
+              << "Skipping:\n   " << entry << "\n   "
               << "aleady has desired format" << std::endl;
         } else {
-          std::osyncstream(std::cout) << "Renaming:\n   " << entry << "\n-> "
+          std::osyncstream(boost::nowide::cout)
+              << "Renaming:\n   " << entry << "\n-> "
                                       << output_dir / new_filename << std::endl;
           boost::filesystem::rename(entry.path(), output_dir / new_filename);
         }
@@ -372,7 +378,7 @@ void Main(std::string_view input_dir,
         ++num_processed_successfully;
         busy.notify_one();
       } catch (const std::exception& error) {
-        std::osyncstream(std::cerr)
+        std::osyncstream(boost::nowide::cerr)
             << "error: " << entry.path().string() << " " << error.what() << std::endl;
         --num_in_progress;
         ++num_failed;
@@ -383,13 +389,16 @@ void Main(std::string_view input_dir,
   work_guard.reset();
   threads.join_all();
 
-  std::cout << num_processed_successfully << " succeeded, " << num_failed
+  boost::nowide::cout << num_processed_successfully << " succeeded, "
+                      << num_failed
             << " failed" << std::endl;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  boost::nowide::nowide_filesystem();
+  boost::nowide::args _(argc, argv);  // Fix arguments - make them UTF-8
   try {
     boost::program_options::options_description flags_description(
         "Supported options");
@@ -406,12 +415,12 @@ int main(int argc, char** argv) {
     boost::program_options::notify(flags);
 
     if (flags.count("help") || flags.empty()) {
-      std::cout << flags_description << std::endl;
+      boost::nowide::cout << flags_description << std::endl;
       return EXIT_SUCCESS;
     }
     if (!flags.count("input_dir")) {
-      std::cout << "input_dir must be provided!\n";
-      std::cout << flags_description << std::endl;
+      boost::nowide::cout << "input_dir must be provided!\n";
+      boost::nowide::cout << flags_description << std::endl;
       return EXIT_FAILURE;
     }
     std::optional<std::string> output_dir;
@@ -420,10 +429,10 @@ int main(int argc, char** argv) {
     }
     Main(flags["input_dir"].as<std::string>(), output_dir);
   } catch (const std::exception& error) {
-    std::cerr << "error: " << error.what() << std::endl;
+    boost::nowide::cerr << "error: " << error.what() << std::endl;
     return EXIT_FAILURE;
   } catch (...) {
-    std::cerr << "Unknown error." << std::endl;
+    boost::nowide::cerr << "Unknown error." << std::endl;
     return EXIT_FAILURE;
   }
 
